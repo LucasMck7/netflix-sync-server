@@ -88,8 +88,13 @@ setInterval(() => {
   }
 }, 60000).unref();
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url || '/', 'http://x');
+function handle(req, res) {
+  let url;
+  try {
+    url = new URL(req.url || '/', 'http://x');
+  } catch (e) {
+    return reply(res, 400, { ok: false, error: 'adresse invalide' }); // ex. « // » : ne doit pas faire tomber le serveur
+  }
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -138,7 +143,13 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname.startsWith('/diag/')) {
-    const room = roomKey(decodeURIComponent(url.pathname.slice(6)));
+    let raw = url.pathname.slice(6);
+    try {
+      raw = decodeURIComponent(raw);
+    } catch (e) {
+      /* pourcentage mal formé : on garde le texte tel quel */
+    }
+    const room = roomKey(raw);
     const now = Date.now();
     const items = [...(diags.get(room) || new Map()).entries()]
       .filter(([, e]) => now - e.at <= DIAG_TTL_MS)
@@ -149,7 +160,24 @@ const server = http.createServer((req, res) => {
 
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('Watch Sync server OK (v' + PROTOCOL + ')\n');
+}
+
+const server = http.createServer((req, res) => {
+  try {
+    handle(req, res);
+  } catch (e) {
+    console.error('[http]', e);
+    try {
+      reply(res, 500, { ok: false, error: 'erreur du serveur' });
+    } catch (e2) {
+      /* réponse déjà partie */
+    }
+  }
 });
+
+// Dernier filet : une erreur imprévue ne doit jamais vider toutes les salles en cours.
+process.on('uncaughtException', (e) => console.error('[erreur]', e));
+process.on('unhandledRejection', (e) => console.error('[rejet]', e));
 
 const wss = new WebSocketServer({ server });
 
