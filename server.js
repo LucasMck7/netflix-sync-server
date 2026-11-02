@@ -1,19 +1,152 @@
-// Watch Sync : serveur de relais (protocole v2).
+// Watch Sync : serveur de relais (protocole v3).
 // Il ne voit passer que des commandes (lecture / pause / position / adresse de la page),
 // jamais de vidéo. Compatible avec les anciennes versions de l'extension.
+// v3 ajoute deux petites routes HTTP : /config (réglages distants, fichier config.json)
+// et /diag (dépôt et lecture de diagnostics, gardés 30 min en mémoire).
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
-const PROTOCOL = 2;
+const PROTOCOL = 3;
 const MAX_PER_ROOM = 10;
 const HOLD_TIMEOUT_MS = Number(process.env.HOLD_TIMEOUT_MS) || 20000; // attente max d'un lecteur qui charge
 const RATE_PER_SEC = 20; // anti-flood : messages par seconde et par client
 const RATE_BURST = 60;
 const ACTIONS = new Set(['play', 'pause', 'seek']);
 
+// ---------- routes HTTP : /config et /diag ----------
+const DIAG_TTL_MS = Number(process.env.DIAG_TTL_MS) || 30 * 60 * 1000;
+const MAX_DIAG_BYTES = 64 * 1024;
+const MAX_DIAG_ROOMS = 300;
+const MAX_DIAG_PER_ROOM = 8;
+const POSTS_PER_MIN = 12;
+const diags = new Map(); // room -> Map(who -> { at, data })
+const posts = new Map(); // ip -> [timestamps]
+
+function loadConfig() {
+  try {
+    const text = fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8');
+    if (text.length > 16 * 1024) return {};
+    const o = JSON.parse(text);
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+const roomKey = (v) => String(v || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 64);
+const whoKey = (v) => String(v || 'x').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'x';
+
+function reply(res, code, obj) {
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type',
+    'cache-control': 'no-store',
+  });
+  res.end(JSON.stringify(obj));
+}
+
+function tooManyPosts(req) {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const now = Date.now();
+  const list = (posts.get(ip) || []).filter((t) => now - t < 60000);
+  list.push(now);
+  posts.set(ip, list);
+  return list.length > POSTS_PER_MIN;
+}
+
+function storeDiag(room, who, data) {
+  let m = diags.get(room);
+  if (!m) {
+    if (diags.size >= MAX_DIAG_ROOMS) {
+      const oldest = [...diags.entries()].sort((a, b) => maxAt(a[1]) - maxAt(b[1]))[0];
+      if (oldest) diags.delete(oldest[0]);
+    }
+    m = new Map();
+    diags.set(room, m);
+  }
+  m.set(who, { at: Date.now(), data });
+  while (m.size > MAX_DIAG_PER_ROOM) m.delete([...m.entries()].sort((a, b) => a[1].at - b[1].at)[0][0]);
+}
+const maxAt = (m) => Math.max(0, ...[...m.values()].map((e) => e.at));
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [room, m] of diags) {
+    for (const [who, e] of m) if (now - e.at > DIAG_TTL_MS) m.delete(who);
+    if (!m.size) diags.delete(room);
+  }
+  for (const [ip, list] of posts) {
+    const keep = list.filter((t) => now - t < 60000);
+    if (keep.length) posts.set(ip, keep);
+    else posts.delete(ip);
+  }
+}, 60000).unref();
+
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', 'http://x');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'GET, POST, OPTIONS',
+      'access-control-allow-headers': 'content-type',
+    });
+    return res.end();
+  }
+
+  if (req.method === 'GET' && url.pathname === '/config') {
+    return reply(res, 200, { ok: true, serverV: PROTOCOL, config: loadConfig() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/diag') {
+    const room = roomKey(url.searchParams.get('room'));
+    if (!room) return reply(res, 400, { ok: false, error: 'room manquante' });
+    if (tooManyPosts(req)) return reply(res, 429, { ok: false, error: 'trop de requêtes' });
+    const who = whoKey(url.searchParams.get('who'));
+    let size = 0;
+    const chunks = [];
+    let aborted = false;
+    req.on('data', (c) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > MAX_DIAG_BYTES) {
+        aborted = true;
+        reply(res, 413, { ok: false, error: 'diagnostic trop gros' });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      let data;
+      try {
+        data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch (e) {
+        return reply(res, 400, { ok: false, error: 'JSON invalide' });
+      }
+      storeDiag(room, who, data);
+      reply(res, 200, { ok: true, room, who, bytes: size });
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/diag/')) {
+    const room = roomKey(decodeURIComponent(url.pathname.slice(6)));
+    const now = Date.now();
+    const items = [...(diags.get(room) || new Map()).entries()]
+      .filter(([, e]) => now - e.at <= DIAG_TTL_MS)
+      .sort((a, b) => b[1].at - a[1].at)
+      .map(([who, e]) => ({ who, ageSec: Math.round((now - e.at) / 1000), data: e.data }));
+    return reply(res, 200, { ok: true, room, items });
+  }
+
   res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
   res.end('Watch Sync server OK (v' + PROTOCOL + ')\n');
 });
